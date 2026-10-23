@@ -131,6 +131,13 @@ impl Service<Name> for Resolver {
   }
 
   fn call(&mut self, name: Name) -> Self::Future {
+    if !matches!(self.kind, ResolverKind::Custom(_))
+      && let Some(addrs) = localhost_subdomain_addrs(&name)
+    {
+      return ResolveFut {
+        inner: tokio::spawn(async move { Ok(addrs) }),
+      };
+    }
     let task = match &mut self.kind {
       ResolverKind::Gai(gai_resolver) => {
         let mut resolver = gai_resolver.clone();
@@ -155,6 +162,20 @@ impl Service<Name> for Resolver {
     };
     ResolveFut { inner: task }
   }
+}
+
+/// Names under `localhost.` always mean the loopback address (RFC 6761,
+/// section 6.3), but system resolvers often don't know them.
+fn localhost_subdomain_addrs(name: &Name) -> Option<SocketAddrs> {
+  let host = name.as_str().trim_end_matches('.').to_ascii_lowercase();
+  if !host.ends_with(".localhost") {
+    return None;
+  }
+  let addrs = vec![
+    SocketAddr::from(([127, 0, 0, 1], 0)),
+    SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+  ];
+  Some(addrs.into_iter())
 }
 
 /// `Service<Uri>` adapter that runs the net-deny permission check on every
@@ -418,5 +439,29 @@ mod tests {
 
     let addr = addr.next().unwrap();
     assert_eq!(addr, "127.0.0.1:8080".parse().unwrap());
+  }
+
+  // https://github.com/denoland/deno/issues/36868
+  #[tokio::test]
+  async fn localhost_subdomains_resolve_to_loopback() {
+    for name in ["foo.localhost", "a.b.LOCALHOST", "foo.localhost."] {
+      let addrs: Vec<_> = Resolver::gai()
+        .call(Name::from_str(name).unwrap())
+        .await
+        .unwrap()
+        .collect();
+      assert_eq!(
+        addrs,
+        vec![
+          "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+          "[::1]:0".parse().unwrap()
+        ],
+        "{name}"
+      );
+    }
+    assert!(
+      localhost_subdomain_addrs(&Name::from_str("localhost.com").unwrap())
+        .is_none()
+    );
   }
 }
